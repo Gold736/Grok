@@ -1,0 +1,69 @@
+package com.grog.assistant
+
+/**
+ * Разбор голосовых команд.
+ * Грогу разрешены ТОЛЬКО три приложения: Telegram, YouTube и WhatsApp.
+ */
+object Commands {
+
+    class AppInfo(val spoken: String, val pkg: String, val keywords: List<String>)
+
+    val TELEGRAM = AppInfo(
+        "Телеграм", "org.telegram.messenger",
+        listOf("телеграм", "телега", "telegram")
+    )
+    val YOUTUBE = AppInfo(
+        "Ютуб", "com.google.android.youtube",
+        listOf("ютуб", "ютьюб", "ютюб", "youtube")
+    )
+    val WHATSAPP = AppInfo(
+        "Ватсап", "com.whatsapp",
+        listOf("ватсап", "вотсап", "вацап", "whatsapp", "ват сап")
+    )
+
+    /** Единственный список приложений, которые Грог может открыть. */
+    val ALLOWED = listOf(TELEGRAM, YOUTUBE, WHATSAPP)
+
+    private val OPEN_VERBS = setOf(
+        "зайди", "зайти", "открой", "открыть", "запусти", "включи", "войди", "зайдите"
+    )
+    private val STOP_WORDS = setOf("стоп", "хватит", "замолчи", "тихо")
+
+    private val searchRegex = Regex(
+        "(?:найди|поищи|включи|покажи)\\s+(.+?)\\s+(?:в|на)\\s+(?:ютубе|ютуб|ютьюбе|ютюбе|youtube)"
+    )
+
+    sealed class Result {
+        object Stop : Result()
+        class Open(val app: AppInfo, val query: String?) : Result()
+        object Denied : Result()
+        class Question(val text: String) : Result()
+    }
+
+    fun normalize(s: String): String =
+        s.lowercase()
+            .replace('ё', 'е')
+            .replace(Regex("[^\\p{L}\\p{N}\\s]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    fun parse(t: String): Result {
+        val words = t.split(" ").filter { it.isNotEmpty() }
+
+        if (words.size <= 3 && words.any { it in STOP_WORDS }) return Result.Stop
+
+        val hasVerb = words.any { it in OPEN_VERBS }
+        val app = ALLOWED.firstOrNull { a -> a.keywords.any { t.contains(it) } }
+
+        if (app != null) {
+            val query = if (app === YOUTUBE) searchRegex.find(t)?.groupValues?.get(1) else null
+            if (query != null || hasVerb || words.size <= 3) return Result.Open(app, query)
+            return Result.Question(t)
+        }
+
+        // Просят открыть что-то другое — отказываем.
+        if (hasVerb) return Result.Denied
+
+        return Result.Question(t)
+    }
+}
