@@ -1,0 +1,347 @@
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.PixelFormat
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.view.Gravity
+import android.view.WindowManager
+import java.util.Locale
+import java.util.concurrent.Executors
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.random.Random
+
+class GrogService : Service() {
+
+    companion object {
+        private const val CHANNEL = "grog"
+        private val WAKE = setOf("грог", "грок", "крог", "крок", "грох", "грогг")
+    }
+
+    private lateinit var wm: WindowManager
+    private lateinit var grog: GrogView
+    private lateinit var lp: WindowManager.LayoutParams
+
+    private val main = Handler(Looper.getMainLooper())
+    private val net = Executors.newSingleThreadExecutor()
+
+    private var recognizer: SpeechRecognizer? = null
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+
+    private var running = true
+    private var speaking = false
+    private var thinking = false
+    private var awaitingCommand = false
+    private var warnedNoRecognizer = false
+
+    private var px = 100f
+    private var py = 300f
+    private var vx = 4f
+    private var vy = 3f
+    private var sizePx = 0
+    private var screenW = 0
+    private var screenH = 0
+    private var density = 1f
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
+
+    override fun onCreate() {
+        super.onCreate()
+        startAsForeground()
+        try {
+            setupOverlay()
+        } catch (e: Exception) {
+            stopSelf()
+            return
+        }
+        tts = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts?.language = Locale("ru", "RU")
+                // Свой голос Грога: чуть выше и быстрее обычного
+                tts?.setPitch(1.35f)
+                tts?.setSpeechRate(1.1f)
+                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {}
+                    override fun onDone(utteranceId: String?) { main.post { finishSpeaking() } }
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) { main.post { finishSpeaking() } }
+                })
+                ttsReady = true
+                main.post { say("Привет! Я Грог. Скажи: Привет, Грог.") }
+            } else {
+                main.post { scheduleListen(500) }
+            }
+        }
+        main.post(moveTick)
+    }
+
+    // ---------- Overlay ----------
+
+    private fun setupOverlay() {
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val dm = resources.displayMetrics
+        density = dm.density
+        screenW = dm.widthPixels
+        screenH = dm.heightPixels
+        sizePx = (130 * density).toInt()
+        px = screenW / 3f
+        py = screenH / 2f
+        newDirection()
+
+        grog = GrogView(this)
+        lp = WindowManager.LayoutParams(
+            sizePx, sizePx,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        )
+        lp.gravity = Gravity.TOP or Gravity.START
+        lp.x = px.toInt()
+        lp.y = py.toInt()
+        wm.addView(grog, lp)
+
+        grog.setOnClickListener {
+            if (!speaking && !thinking) {
+                awaitingCommand = true
+                say("Слушаю")
+            }
+        }
+    }
+
+    private fun newDirection() {
+        val angle = Random.nextFloat() * 2f * PI.toFloat()
+        val speed = 2.5f * density
+        vx = cos(angle) * speed
+        vy = sin(angle) * speed
+    }
+
+    private val moveTick = object : Runnable {
+        override fun run() {
+            if (!running) return
+            val busy = speaking || thinking || awaitingCommand || grog.isHearing
+            grog.running = !busy
+            if (!busy) {
+                px += vx
+                py += vy
+                val maxX = (screenW - sizePx).toFloat()
+                val maxY = (screenH - sizePx).toFloat()
+                if (px < 0f) { px = 0f; vx = abs(vx) } else if (px > maxX) { px = maxX; vx = -abs(vx) }
+                if (py < 0f) { py = 0f; vy = abs(vy) } else if (py > maxY) { py = maxY; vy = -abs(vy) }
+                if (Random.nextInt(150) == 0) newDirection()
+                lp.x = px.toInt()
+                lp.y = py.toInt()
+                try { wm.updateViewLayout(grog, lp) } catch (_: Exception) {}
+            }
+            main.postDelayed(this, 33)
+        }
+    }
+
+    // ---------- Слушание ----------
+
+    private val listenTask = Runnable { startRecognizer() }
+
+    private fun scheduleListen(delayMs: Long) {
+        main.removeCallbacks(listenTask)
+        main.postDelayed(listenTask, delayMs)
+    }
+
+    private fun startRecognizer() {
+        if (!running || speaking || thinking) return
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            if (!warnedNoRecognizer) {
+                warnedNoRecognizer = true
+                say("На телефоне нет службы распознавания речи")
+            }
+            return
+        }
+        recognizer?.destroy()
+        recognizer = SpeechRecognizer.createSpeechRecognizer(this).also { r ->
+            r.setRecognitionListener(listener)
+            val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+            i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+            r.startListening(i)
+        }
+    }
+
+    private val listener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(rmsdB: Float) { if (rmsdB > 5f) grog.hear() }
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+        override fun onPartialResults(partialResults: Bundle?) {}
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+
+        override fun onError(error: Int) {
+            if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                stopSelf()
+                return
+            }
+            if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                awaitingCommand = false
+            }
+            if (!speaking && !thinking) {
+                scheduleListen(if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1500 else 400)
+            }
+        }
+
+        override fun onResults(results: Bundle?) {
+            val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+            if (text.isNullOrBlank()) {
+                awaitingCommand = false
+                scheduleListen(300)
+                return
+            }
+            handle(Commands.normalize(text))
+            if (!speaking && !thinking) scheduleListen(300)
+        }
+    }
+
+    // ---------- Команды ----------
+
+    private fun handle(t: String) {
+        val tokens = t.split(" ").filter { it.isNotEmpty() }
+        val heardWake = tokens.any { it in WAKE }
+        if (!awaitingCommand && !heardWake) return
+
+        val cmd = tokens.filter { it !in WAKE && it != "привет" }.joinToString(" ")
+        awaitingCommand = false
+        if (cmd.isBlank()) {
+            awaitingCommand = true
+            say("Слушаю")
+            return
+        }
+        execute(cmd)
+    }
+
+    private fun execute(cmd: String) {
+        when (val r = Commands.parse(cmd)) {
+            is Commands.Result.Stop -> {
+                tts?.stop()
+                finishSpeaking()
+            }
+            is Commands.Result.Open -> {
+                if (openApp(r.app, r.query)) {
+                    say(if (r.query != null) "Ищу ${r.query} на ютубе" else "Открываю ${r.app.spoken}")
+                } else {
+                    say("${r.app.spoken} не установлен")
+                }
+            }
+            is Commands.Result.Denied -> say("Мне можно открывать только Телеграм, Ютуб и Ватсап")
+            is Commands.Result.Question -> ask(r.text)
+        }
+    }
+
+    private fun openApp(app: Commands.AppInfo, query: String?): Boolean {
+        // Защита: открываем только приложения из белого списка.
+        if (Commands.ALLOWED.none { it.pkg == app.pkg }) return false
+        val launch = packageManager.getLaunchIntentForPackage(app.pkg) ?: return false
+        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (query != null && app.pkg == Commands.YOUTUBE.pkg) {
+            try {
+                val search = Intent(Intent.ACTION_SEARCH)
+                    .setPackage(app.pkg)
+                    .putExtra("query", query)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(search)
+                return true
+            } catch (e: Exception) {
+                // откроем просто YouTube
+            }
+        }
+        return try {
+            startActivity(launch)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun ask(question: String) {
+        thinking = true
+        grog.mode = GrogView.Mode.THINKING
+        recognizer?.cancel()
+        net.execute {
+            val answer = WebAnswer.ask(question)
+            main.post {
+                thinking = false
+                say(answer ?: "Не нашёл ответ в интернете")
+            }
+        }
+    }
+
+    // ---------- Голос ----------
+
+    private fun say(text: String) {
+        speaking = true
+        grog.mode = GrogView.Mode.SPEAKING
+        recognizer?.cancel()
+        main.removeCallbacks(listenTask)
+        if (!ttsReady) {
+            finishSpeaking()
+            return
+        }
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "grog")
+    }
+
+    private fun finishSpeaking() {
+        speaking = false
+        grog.mode = GrogView.Mode.IDLE
+        scheduleListen(300)
+    }
+
+    // ---------- Служебное ----------
+
+    private fun startAsForeground() {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL, "Грог", NotificationManager.IMPORTANCE_LOW)
+        )
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+        )
+        val n = Notification.Builder(this, CHANNEL)
+            .setContentTitle("Грог слушает")
+            .setContentText("Скажи: Привет, Грог")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentIntent(open)
+            .build()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        } else {
+            startForeground(1, n)
+        }
+    }
+
+    override fun onDestroy() {
+        running = false
+        main.removeCallbacksAndMessages(null)
+        recognizer?.destroy()
+        tts?.shutdown()
+        net.shutdownNow()
+        try { wm.removeView(grog) } catch (_: Exception) {}
+        super.onDestroy()
+    }
+}
