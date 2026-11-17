@@ -1,0 +1,75 @@
+
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+
+/** Ответы из интернета без ключей и API-регистрации: открытая Википедия. */
+object WebAnswer {
+
+    private val PREFIXES = listOf(
+        "расскажи мне про", "расскажи мне о", "расскажи про", "расскажи о",
+        "что такое", "что значит", "кто такой", "кто такая", "кто такие", "кто это",
+        "найди информацию о", "найди информацию про", "найди", "скажи"
+    )
+
+    fun ask(question: String): String? {
+        return try {
+            val q = clean(question)
+            if (q.isBlank()) return null
+            val title = searchTitle(q) ?: return null
+            val extract = summary(title) ?: return null
+            shorten(extract)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun clean(s: String): String {
+        var q = s.trim()
+        for (p in PREFIXES) {
+            if (q.startsWith("$p ")) {
+                q = q.removePrefix("$p ").trim()
+                break
+            }
+        }
+        return q
+    }
+
+    private fun searchTitle(q: String): String? {
+        val url = "https://ru.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=1&srsearch=" +
+            URLEncoder.encode(q, "UTF-8")
+        val body = get(url) ?: return null
+        val arr = JSONObject(body).getJSONObject("query").getJSONArray("search")
+        if (arr.length() == 0) return null
+        return arr.getJSONObject(0).getString("title")
+    }
+
+    private fun summary(title: String): String? {
+        val url = "https://ru.wikipedia.org/api/rest_v1/page/summary/" +
+            URLEncoder.encode(title, "UTF-8").replace("+", "%20")
+        val body = get(url) ?: return null
+        return JSONObject(body).optString("extract").takeIf { it.isNotBlank() }
+    }
+
+    private fun shorten(text: String): String {
+        val noBrackets = text.replace(Regex("\\([^)]*\\)"), "").replace(Regex("\\s+"), " ").trim()
+        val sentences = noBrackets.split(Regex("(?<=[.!?])\\s+"))
+        var out = sentences.take(2).joinToString(" ")
+        if (out.length > 320) out = sentences.first()
+        if (out.length > 320) out = out.take(320).substringBeforeLast(" ")
+        return out
+    }
+
+    private fun get(url: String): String? {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.connectTimeout = 8000
+        c.readTimeout = 8000
+        c.setRequestProperty("User-Agent", "GrogAssistant/1.0 (Android)")
+        return try {
+            if (c.responseCode == 200) c.inputStream.bufferedReader().readText() else null
+        } finally {
+            c.disconnect()
+        }
+    }
+}
