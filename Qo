@@ -1,0 +1,97 @@
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+
+class MainActivity : Activity() {
+
+    private lateinit var status: TextView
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val pad = (20 * resources.displayMetrics.density).toInt()
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+        }
+
+        fun tv(s: String, size: Float) = TextView(this).apply {
+            text = s
+            textSize = size
+            setPadding(0, 0, 0, pad / 2)
+        }
+
+        fun btn(label: String, click: () -> Unit) = Button(this).apply {
+            text = label
+            setOnClickListener { click() }
+        }
+
+        root.addView(tv("Грог", 30f))
+        root.addView(
+            tv(
+                "Скажи «Привет, Грог», а потом команду.\n\n" +
+                    "Команды:\n• «Зайди в Телеграм»\n• «Открой Ютуб»\n• «Найди котиков в ютубе»\n• «Открой Ватсап»\n\n" +
+                    "Вопросы: «Привет, Грог, кто такой Пушкин?» — ответ из интернета (Википедия).\n\n" +
+                    "Грогу разрешены только Telegram, YouTube и WhatsApp.",
+                16f
+            )
+        )
+        status = tv("", 14f)
+        root.addView(status)
+
+        root.addView(btn("1. Разрешить микрофон") { askAudio() })
+        root.addView(btn("2. Разрешить поверх экранов") { askOverlay() })
+        root.addView(btn("3. Запустить Грога") { startGrog() })
+        root.addView(btn("Остановить Грога") { stopService(Intent(this, GrogService::class.java)) })
+
+        setContentView(ScrollView(this).apply { addView(root) })
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updateStatus()
+    }
+
+    private fun hasMic() = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun updateStatus() {
+        status.text = "Микрофон: " + (if (hasMic()) "разрешён" else "нужно разрешить") +
+            "\nПоверх экранов: " + (if (Settings.canDrawOverlays(this)) "разрешено" else "нужно разрешить")
+    }
+
+    private fun askAudio() {
+        val perms = if (Build.VERSION.SDK_INT >= 33) {
+            arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            arrayOf(Manifest.permission.RECORD_AUDIO)
+        }
+        requestPermissions(perms, 1)
+    }
+
+    private fun askOverlay() {
+        startActivity(
+            Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+        )
+    }
+
+    private fun startGrog() {
+        updateStatus()
+        if (!hasMic() || !Settings.canDrawOverlays(this)) return
+        startForegroundService(Intent(this, GrogService::class.java))
+        moveTaskToBack(true)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        updateStatus()
+    }
+}
